@@ -123,8 +123,18 @@ adminRouter.get('/api/logs', (req, res) => {
 adminRouter.post('/api/logout', async (req, res) => {
     logger.log('🧨 Factory Reset requested. Wiping session...');
     try { if (botState.status === 'connected') await client.logout(); } catch (e) {}
-    const authDir = path.join(DATA_DIR, '.wwebjs_auth');
-    if (fs.existsSync(authDir)) fs.rmSync(authDir, { recursive: true, force: true });
+
+    try {
+        const files = fs.readdirSync(DATA_DIR);
+        for (const file of files) {
+            if (file.startsWith('session') || file.startsWith('.wwebjs_auth')) {
+                fs.rmSync(path.join(DATA_DIR, file), { recursive: true, force: true });
+            }
+        }
+    } catch(e) {
+        logger.error("Error wiping session files: " + e.message);
+    }
+
     res.json({ success: true, message: "Restarting container..." });
     setTimeout(() => process.exit(1), 1000);
 });
@@ -133,23 +143,29 @@ app.use(ADMIN_ROUTE, adminRouter);
 app.use((req, res) => res.status(404).send('<h1>404 - Unauthorized Access Area</h1>'));
 
 function clearChromiumLocks() {
-    const authDir = path.join(DATA_DIR, '.wwebjs_auth');
-    if (!fs.existsSync(authDir)) return;
-    const targetLocks = ['SingletonLock', 'SingletonCookie', 'SingletonSocket'];
+    const targetLocks =['SingletonLock', 'SingletonCookie', 'SingletonSocket', 'DevToolsActivePort'];
+
     const cleanDirectory = (dirPath) => {
+        if (!fs.existsSync(dirPath)) return;
         try {
             const files = fs.readdirSync(dirPath, { withFileTypes: true });
             for (const file of files) {
                 const fullPath = path.join(dirPath, file.name);
-                if (file.isDirectory()) cleanDirectory(fullPath);
-                else if (targetLocks.includes(file.name)) {
-                    fs.unlinkSync(fullPath);
-                    logger.log(`🧹 Removed stale lock: ${file.name}`);
+
+                if (targetLocks.includes(file.name)) {
+                    try {
+                        fs.unlinkSync(fullPath);
+                        logger.log(`🧹 Scavenger removed stale Chromium lock: ${file.name}`);
+                    } catch (err) {}
+                }
+                else if (file.isDirectory()) {
+                    cleanDirectory(fullPath);
                 }
             }
         } catch (e) {}
     };
-    cleanDirectory(authDir);
+
+    cleanDirectory(DATA_DIR);
 }
 
 const client = new Client({
@@ -286,11 +302,12 @@ async function sendMenu(chat, userId, cfg) {
     userSessions.set(userId, { state: 'MENU', timestamp: Date.now() });
 }
 
+clearChromiumLocks();
+
 app.listen(3005, () => {
     console.log(`[Server] Booted Successfully.`);
     console.log(`[Access] ➔  http://84.200.154.242:3005${ADMIN_ROUTE}/`);
     console.log(`[Credentials] Username: Ghost | Password: DarkWebGhostX20260000`);
 });
 
-clearChromiumLocks();
 client.initialize().catch(err => logger.error("CRITICAL Chromium Error: " + err.message));
