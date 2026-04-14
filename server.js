@@ -8,7 +8,6 @@ const qrcode = require('qrcode');
 
 const DATA_DIR = path.join(__dirname, 'data');
 const CONFIG_FILE = path.join(DATA_DIR, 'config.json');
-const AUTH_DIR = path.join(DATA_DIR, '.wwebjs_auth');
 
 if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
 
@@ -34,54 +33,80 @@ const DEFAULT_CONFIG = {
     }
 };
 
-function ensureValidConfig() {
-    try {
-        if (!fs.existsSync(CONFIG_FILE)) fs.writeFileSync(CONFIG_FILE, JSON.stringify(DEFAULT_CONFIG, null, 4));
-        const data = fs.readFileSync(CONFIG_FILE, 'utf8');
-        if (!data || data.trim() === '') throw new Error("Empty JSON");
-
-        let parsed = JSON.parse(data);
-        if(!parsed.customCommands) parsed.customCommands = DEFAULT_CONFIG.customCommands;
-        return parsed;
-    } catch (error) {
-        fs.writeFileSync(CONFIG_FILE, JSON.stringify(DEFAULT_CONFIG, null, 4));
-        return DEFAULT_CONFIG;
-    }
-}
-
-const getConfig = () => ensureValidConfig();
-const saveConfig = (cfg) => fs.writeFileSync(CONFIG_FILE, JSON.stringify(cfg, null, 4));
-
+// Application State
 let botState = { status: 'initializing', qrCodeUrl: null };
+let config = { ...DEFAULT_CONFIG };
 
+// Load config securely into Memory on boot
+function loadAndInitConfig() {
+    try {
+        if (fs.existsSync(CONFIG_FILE)) {
+            const data = fs.readFileSync(CONFIG_FILE, 'utf8');
+            if (data.trim() !== '') {
+                const parsed = JSON.parse(data);
+                // Deep merge defaults to prevent missing objects (like customCommands) from crashing the dashboard
+                config = {
+                    ...DEFAULT_CONFIG,
+                    ...parsed,
+                    wallets: { ...DEFAULT_CONFIG.wallets, ...parsed.wallets },
+                    customCommands: { ...DEFAULT_CONFIG.customCommands, ...parsed.customCommands },
+                    messages: { ...DEFAULT_CONFIG.messages, ...parsed.messages }
+                };
+            }
+        }
+    } catch (error) {
+        console.error("Config parse error, falling back to defaults:", error);
+    }
+    // Write back to ensure valid structure and secure admin path is saved
+    fs.writeFileSync(CONFIG_FILE, JSON.stringify(config, null, 4));
+}
+loadAndInitConfig();
+
+const saveConfig = () => fs.writeFileSync(CONFIG_FILE, JSON.stringify(config, null, 4));
+
+// Logger & SSE Broadcaster
 const logClients = new Set();
 const logger = {
     log: (msg) => {
         const out = `[${new Date().toLocaleTimeString()}] ${msg}`;
         console.log(out);
-        logClients.forEach(c => c.write(`data: ${JSON.stringify({ type: 'info', msg: out })}\n\n`));
+        const payload = JSON.stringify({ type: 'info', msg: out });
+        logClients.forEach(c => c.write(`data: ${payload}\n\n`));
     },
     error: (msg) => {
         const out = `[${new Date().toLocaleTimeString()}] ❌ ${msg}`;
         console.error(out);
-        logClients.forEach(c => c.write(`data: ${JSON.stringify({ type: 'error', msg: out })}\n\n`));
+        const payload = JSON.stringify({ type: 'error', msg: out });
+        logClients.forEach(c => c.write(`data: ${payload}\n\n`));
     }
 };
 
 const app = express();
 app.use(express.json());
 
-const config = getConfig();
 const ADMIN_ROUTE = `/${config.adminPath}`;
+
+// CRITICAL FIX: Trailing Slash Redirect.
+// If the user visits /admin-123, we MUST redirect to /admin-123/
+// otherwise frontend relative fetch('api/status') fails via 404.
+app.use((req, res, next) => {
+    if (req.path === ADMIN_ROUTE) {
+        return res.redirect(ADMIN_ROUTE + '/');
+    }
+    next();
+});
+
 const adminRouter = express.Router();
 
-adminRouter.use(basicAuth({ users: { 'admin': 'admin123' }, challenge: true, realm: 'Elite WhatsApp Bot' }));
+adminRouter.use(basicAuth({ users: { 'Ghost': 'DarkWebGhostX20260000' }, challenge: true, realm: 'Elite WhatsApp Bot' }));
 adminRouter.use(express.static(path.join(__dirname, 'public')));
 
 adminRouter.get('/api/status', (req, res) => res.json(botState));
-adminRouter.get('/api/config', (req, res) => res.json(getConfig()));
+adminRouter.get('/api/config', (req, res) => res.json(config));
+
 adminRouter.post('/api/config', (req, res) => {
-    saveConfig({ ...getConfig(), ...req.body });
+    config = { ...config, ...req.body };
+    saveConfig();
     logger.log("⚙️ Configurations updated and saved live.");
     res.json({ success: true });
 });
@@ -90,6 +115,8 @@ adminRouter.get('/api/logs', (req, res) => {
     res.setHeader('Content-Type', 'text/event-stream');
     res.setHeader('Cache-Control', 'no-cache');
     res.setHeader('Connection', 'keep-alive');
+    res.setHeader('X-Accel-Buffering', 'no'); // CRITICAL FIX for NGINX/VPS Proxies
+
     logClients.add(res);
     req.on('close', () => logClients.delete(res));
 });
@@ -97,16 +124,21 @@ adminRouter.get('/api/logs', (req, res) => {
 adminRouter.post('/api/logout', async (req, res) => {
     logger.log('🧨 Factory Reset requested. Wiping session...');
     try { if (botState.status === 'connected') await client.logout(); } catch (e) {}
-    if (fs.existsSync(AUTH_DIR)) fs.rmSync(AUTH_DIR, { recursive: true, force: true });
+
+    const authDir = path.join(DATA_DIR, '.wwebjs_auth');
+    if (fs.existsSync(authDir)) fs.rmSync(authDir, { recursive: true, force: true });
+
     res.json({ success: true, message: "Restarting container..." });
     setTimeout(() => process.exit(1), 1000);
 });
 
 app.use(ADMIN_ROUTE, adminRouter);
-app.use((req, res) => res.status(404).send('<h1>404 - Not Found</h1>'));
+app.use((req, res) => res.status(404).send('<h1>404 - Unauthorized Access Area</h1>'));
 
+// WhatsApp Core Engine
 function clearChromiumLocks() {
-    if (!fs.existsSync(AUTH_DIR)) return;
+    const authDir = path.join(DATA_DIR, '.wwebjs_auth');
+    if (!fs.existsSync(authDir)) return;
     const targetLocks = ['SingletonLock', 'SingletonCookie', 'SingletonSocket'];
     const cleanDirectory = (dirPath) => {
         try {
@@ -121,12 +153,22 @@ function clearChromiumLocks() {
             }
         } catch (e) {}
     };
-    cleanDirectory(AUTH_DIR);
+    cleanDirectory(authDir);
 }
 
 const client = new Client({
-    authStrategy: new LocalAuth({ dataPath: AUTH_DIR }),
-    puppeteer: { executablePath: '/usr/bin/chromium', args:['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-gpu'] }
+    authStrategy: new LocalAuth({ dataPath: DATA_DIR }),
+    puppeteer: {
+        executablePath: '/usr/bin/chromium',
+        args:[
+            '--no-sandbox',
+            '--disable-setuid-sandbox',
+            '--disable-dev-shm-usage',
+            '--disable-gpu',
+            '--no-zygote',
+            '--single-process'
+        ]
+    }
 });
 
 const userSessions = new Map();
@@ -155,25 +197,26 @@ client.on('disconnected', () => {
 });
 
 client.on('message', async (msg) => {
-    const cfg = getConfig();
-    if (!cfg.botActive || msg.fromMe) return;
+    if (!config.botActive || msg.fromMe) return;
 
     const text = msg.body.trim().toLowerCase();
-    const trigger = cfg.triggerCommand.toLowerCase();
+    const trigger = config.triggerCommand.toLowerCase();
     const senderId = msg.author || msg.from;
     const chat = await msg.getChat();
 
     if (spamCooldown.has(senderId)) return;
 
-    const customMatch = Object.keys(cfg.customCommands).find(cmd => cmd.toLowerCase() === text);
+    // Handle Custom Commands
+    const customMatch = Object.keys(config.customCommands).find(cmd => cmd.toLowerCase() === text);
     if (customMatch) {
         spamCooldown.add(senderId); setTimeout(() => spamCooldown.delete(senderId), 5000);
         logger.log(`💬 Handled custom command [${customMatch}] from ${senderId.split('@')[0]}`);
         await simulateTyping(chat, 1000);
-        await chat.sendMessage(cfg.customCommands[customMatch]);
+        await chat.sendMessage(config.customCommands[customMatch]);
         return;
     }
 
+    // Handle Main Trigger Flow
     if (text === trigger) {
         spamCooldown.add(senderId); setTimeout(() => spamCooldown.delete(senderId), 5000);
         logger.log(`💳 Initiated payment flow for ${senderId.split('@')[0]}`);
@@ -181,13 +224,13 @@ client.on('message', async (msg) => {
         if (chat.isGroup) {
             await simulateTyping(chat, 1000);
             const contact = await msg.getContact();
-            let groupMsg = cfg.messages.groupReply.replace('@user', `@${contact.number}`);
+            let groupMsg = config.messages.groupReply.replace('@user', `@${contact.number}`);
             await chat.sendMessage(groupMsg, { mentions: [contact] });
 
             const dmChat = await client.getChatById(senderId);
-            await sendMenu(dmChat, senderId, cfg);
+            await sendMenu(dmChat, senderId, config);
         } else {
-            await sendMenu(chat, senderId, cfg);
+            await sendMenu(chat, senderId, config);
         }
     }
     else if (!chat.isGroup) {
@@ -201,18 +244,18 @@ client.on('message', async (msg) => {
 
         if (session.state === 'MENU' && !isNaN(text)) {
             const index = parseInt(text) - 1;
-            const coins = Object.keys(cfg.wallets);
+            const coins = Object.keys(config.wallets);
 
             if (index >= 0 && index < coins.length) {
                 const selectedCoin = coins[index];
-                const address = cfg.wallets[selectedCoin];
+                const address = config.wallets[selectedCoin];
 
                 logger.log(`🏦 Sent ${selectedCoin} wallet to ${senderId.split('@')[0]}`);
                 await simulateTyping(chat, 2000);
                 const qrDataUrl = await qrcode.toDataURL(address, { width: 400, margin: 2 });
                 const media = new MessageMedia('image/png', qrDataUrl.split(',')[1], 'wallet-qr.png');
 
-                await chat.sendMessage(media, { caption: `🏦 *${selectedCoin}*\n\n\`\`\`${address}\`\`\`\n\n${cfg.messages.successText}` });
+                await chat.sendMessage(media, { caption: `🏦 *${selectedCoin}*\n\n\`\`\`${address}\`\`\`\n\n${config.messages.successText}` });
                 userSessions.set(senderId, { state: 'AWAITING_RECEIPT', timestamp: Date.now(), coin: selectedCoin });
             }
         }
@@ -221,8 +264,8 @@ client.on('message', async (msg) => {
             await simulateTyping(chat, 1000);
             await chat.sendMessage("✅ *Receipt Received!*\n\nThank you. Our team has been notified and is verifying your transaction. We will get back to you shortly.");
 
-            if (cfg.adminPhone) {
-                const adminId = `${cfg.adminPhone.replace(/[^0-9]/g, '')}@c.us`;
+            if (config.adminPhone) {
+                const adminId = `${config.adminPhone.replace(/[^0-9]/g, '')}@c.us`;
                 const contact = await msg.getContact();
                 const alertMsg = `🚨 *NEW PAYMENT SUBMISSION*\n\n👤 *From:* +${contact.number}\n🪙 *Network:* ${session.coin}\n💬 *Message:* ${msg.hasMedia ? '[Attached Image]' : text}`;
 
@@ -234,7 +277,7 @@ client.on('message', async (msg) => {
                         await client.sendMessage(adminId, alertMsg);
                     }
                     logger.log(`📬 Receipt forwarded to Admin successfully.`);
-                } catch (err) { logger.error('Could not forward to admin', err); }
+                } catch (err) { logger.error('Could not forward to admin: ' + err.message); }
             }
             userSessions.delete(senderId);
         }
@@ -250,8 +293,10 @@ async function sendMenu(chat, userId, cfg) {
 }
 
 app.listen(3005, () => {
-    console.log(`[Server] Booted. Secure URL: http://84.200.154.242:3005${ADMIN_ROUTE}`);
+    console.log(`[Server] Booted Successfully.`);
+    console.log(`[Access] ➔  http://84.200.154.242:3005${ADMIN_ROUTE}/`);
+    console.log(`[Credentials] Username: Ghost | Password: DarkWebGhostX20260000`);
 });
 
 clearChromiumLocks();
-client.initialize().catch(err => logger.error("CRITICAL Chromium Error:", err));
+client.initialize().catch(err => logger.error("CRITICAL Chromium Error: " + err.message));
