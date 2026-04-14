@@ -1,0 +1,11 @@
+version: '3.8'
+services:
+  whatsapp-bot:
+    build: .
+    container_name: wa-elite-bot
+    restart: unless-stopped
+    ports:
+      - "3005:3005"
+    volumes:
+      - ./.wwebjs_auth:/app/.wwebjs_auth
+      - ./config.json:/app/config.json
