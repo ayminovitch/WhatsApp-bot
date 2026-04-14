@@ -33,38 +33,33 @@ const DEFAULT_CONFIG = {
     }
 };
 
-// Application State
 let botState = { status: 'initializing', qrCodeUrl: null };
 let config = { ...DEFAULT_CONFIG };
 
-// Load config securely into Memory on boot
 function loadAndInitConfig() {
     try {
         if (fs.existsSync(CONFIG_FILE)) {
             const data = fs.readFileSync(CONFIG_FILE, 'utf8');
             if (data.trim() !== '') {
                 const parsed = JSON.parse(data);
-                // Deep merge defaults to prevent missing objects (like customCommands) from crashing the dashboard
                 config = {
                     ...DEFAULT_CONFIG,
                     ...parsed,
-                    wallets: { ...DEFAULT_CONFIG.wallets, ...parsed.wallets },
-                    customCommands: { ...DEFAULT_CONFIG.customCommands, ...parsed.customCommands },
-                    messages: { ...DEFAULT_CONFIG.messages, ...parsed.messages }
+                    wallets: { ...DEFAULT_CONFIG.wallets, ...(parsed.wallets || {}) },
+                    customCommands: { ...DEFAULT_CONFIG.customCommands, ...(parsed.customCommands || {}) },
+                    messages: { ...DEFAULT_CONFIG.messages, ...(parsed.messages || {}) }
                 };
             }
         }
     } catch (error) {
         console.error("Config parse error, falling back to defaults:", error);
     }
-    // Write back to ensure valid structure and secure admin path is saved
     fs.writeFileSync(CONFIG_FILE, JSON.stringify(config, null, 4));
 }
 loadAndInitConfig();
 
 const saveConfig = () => fs.writeFileSync(CONFIG_FILE, JSON.stringify(config, null, 4));
 
-// Logger & SSE Broadcaster
 const logClients = new Set();
 const logger = {
     log: (msg) => {
@@ -86,9 +81,6 @@ app.use(express.json());
 
 const ADMIN_ROUTE = `/${config.adminPath}`;
 
-// CRITICAL FIX: Trailing Slash Redirect.
-// If the user visits /admin-123, we MUST redirect to /admin-123/
-// otherwise frontend relative fetch('api/status') fails via 404.
 app.use((req, res, next) => {
     if (req.path === ADMIN_ROUTE) {
         return res.redirect(ADMIN_ROUTE + '/');
@@ -97,6 +89,13 @@ app.use((req, res, next) => {
 });
 
 const adminRouter = express.Router();
+
+adminRouter.use((req, res, next) => {
+    res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate, max-age=0');
+    res.setHeader('Pragma', 'no-cache');
+    res.setHeader('Expires', '0');
+    next();
+});
 
 adminRouter.use(basicAuth({ users: { 'Ghost': 'DarkWebGhostX20260000' }, challenge: true, realm: 'Elite WhatsApp Bot' }));
 adminRouter.use(express.static(path.join(__dirname, 'public')));
@@ -115,7 +114,7 @@ adminRouter.get('/api/logs', (req, res) => {
     res.setHeader('Content-Type', 'text/event-stream');
     res.setHeader('Cache-Control', 'no-cache');
     res.setHeader('Connection', 'keep-alive');
-    res.setHeader('X-Accel-Buffering', 'no'); // CRITICAL FIX for NGINX/VPS Proxies
+    res.setHeader('X-Accel-Buffering', 'no');
 
     logClients.add(res);
     req.on('close', () => logClients.delete(res));
@@ -124,10 +123,8 @@ adminRouter.get('/api/logs', (req, res) => {
 adminRouter.post('/api/logout', async (req, res) => {
     logger.log('🧨 Factory Reset requested. Wiping session...');
     try { if (botState.status === 'connected') await client.logout(); } catch (e) {}
-
     const authDir = path.join(DATA_DIR, '.wwebjs_auth');
     if (fs.existsSync(authDir)) fs.rmSync(authDir, { recursive: true, force: true });
-
     res.json({ success: true, message: "Restarting container..." });
     setTimeout(() => process.exit(1), 1000);
 });
@@ -135,7 +132,6 @@ adminRouter.post('/api/logout', async (req, res) => {
 app.use(ADMIN_ROUTE, adminRouter);
 app.use((req, res) => res.status(404).send('<h1>404 - Unauthorized Access Area</h1>'));
 
-// WhatsApp Core Engine
 function clearChromiumLocks() {
     const authDir = path.join(DATA_DIR, '.wwebjs_auth');
     if (!fs.existsSync(authDir)) return;
@@ -206,17 +202,15 @@ client.on('message', async (msg) => {
 
     if (spamCooldown.has(senderId)) return;
 
-    // Handle Custom Commands
     const customMatch = Object.keys(config.customCommands).find(cmd => cmd.toLowerCase() === text);
     if (customMatch) {
         spamCooldown.add(senderId); setTimeout(() => spamCooldown.delete(senderId), 5000);
-        logger.log(`💬 Handled custom command [${customMatch}] from ${senderId.split('@')[0]}`);
+        logger.log(`💬 Handled custom command[${customMatch}] from ${senderId.split('@')[0]}`);
         await simulateTyping(chat, 1000);
         await chat.sendMessage(config.customCommands[customMatch]);
         return;
     }
 
-    // Handle Main Trigger Flow
     if (text === trigger) {
         spamCooldown.add(senderId); setTimeout(() => spamCooldown.delete(senderId), 5000);
         logger.log(`💳 Initiated payment flow for ${senderId.split('@')[0]}`);
