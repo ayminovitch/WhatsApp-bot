@@ -91,12 +91,25 @@ app.use((req, res, next) => {
 const adminRouter = express.Router();
 
 adminRouter.use((req, res, next) => {
+    // 1. Anti-Caching Headers
     res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate, max-age=0');
     res.setHeader('Pragma', 'no-cache');
     res.setHeader('Expires', '0');
+
+    // 2. CORS Headers (Allows the browser to use custom fetch headers safely)
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, Cache-Control, Pragma');
+
+    // 3. Bypass Password prompt for OPTIONS preflight requests
+    if (req.method === 'OPTIONS') {
+        return res.sendStatus(200);
+    }
+
     next();
 });
 
+// Protect all routes with Basic Auth (AFTER the preflight bypass)
 adminRouter.use(basicAuth({ users: { 'Ghost': 'DarkWebGhostX20260000' }, challenge: true, realm: 'Elite WhatsApp Bot' }));
 adminRouter.use(express.static(path.join(__dirname, 'public')));
 
@@ -151,7 +164,6 @@ function clearChromiumLocks() {
             const files = fs.readdirSync(dirPath, { withFileTypes: true });
             for (const file of files) {
                 const fullPath = path.join(dirPath, file.name);
-
                 if (targetLocks.includes(file.name)) {
                     try {
                         fs.unlinkSync(fullPath);
