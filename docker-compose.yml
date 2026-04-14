@@ -7,5 +7,4 @@ services:
     ports:
       - "3005:3005"
     volumes:
-      - ./.wwebjs_auth:/app/.wwebjs_auth
-      - ./config.json:/app/config.json
+      - ./data:/app/data
