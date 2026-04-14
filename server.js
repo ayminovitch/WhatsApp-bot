@@ -91,25 +91,17 @@ app.use((req, res, next) => {
 const adminRouter = express.Router();
 
 adminRouter.use((req, res, next) => {
-    // 1. Anti-Caching Headers
     res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate, max-age=0');
     res.setHeader('Pragma', 'no-cache');
     res.setHeader('Expires', '0');
-
-    // 2. CORS Headers (Allows the browser to use custom fetch headers safely)
     res.setHeader('Access-Control-Allow-Origin', '*');
     res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
     res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, Cache-Control, Pragma');
 
-    // 3. Bypass Password prompt for OPTIONS preflight requests
-    if (req.method === 'OPTIONS') {
-        return res.sendStatus(200);
-    }
-
+    if (req.method === 'OPTIONS') return res.sendStatus(200);
     next();
 });
 
-// Protect all routes with Basic Auth (AFTER the preflight bypass)
 adminRouter.use(basicAuth({ users: { 'Ghost': 'DarkWebGhostX20260000' }, challenge: true, realm: 'Elite WhatsApp Bot' }));
 adminRouter.use(express.static(path.join(__dirname, 'public')));
 
@@ -221,88 +213,107 @@ client.on('disconnected', () => {
 });
 
 client.on('message', async (msg) => {
-    if (!config.botActive || msg.fromMe) return;
+    try {
+        if (!config.botActive || msg.fromMe) return;
 
-    const text = msg.body.trim().toLowerCase();
-    const trigger = config.triggerCommand.toLowerCase();
-    const senderId = msg.author || msg.from;
-    const chat = await msg.getChat();
+        const text = msg.body.trim().toLowerCase();
+        const trigger = config.triggerCommand.toLowerCase();
 
-    if (spamCooldown.has(senderId)) return;
+        const senderId = msg.author || msg.from;
+        const chat = await msg.getChat();
 
-    const customMatch = Object.keys(config.customCommands).find(cmd => cmd.toLowerCase() === text);
-    if (customMatch) {
-        spamCooldown.add(senderId); setTimeout(() => spamCooldown.delete(senderId), 5000);
-        logger.log(`💬 Handled custom command[${customMatch}] from ${senderId.split('@')[0]}`);
-        await simulateTyping(chat, 1000);
-        await chat.sendMessage(config.customCommands[customMatch]);
-        return;
-    }
+        if (spamCooldown.has(senderId)) return;
 
-    if (text === trigger) {
-        spamCooldown.add(senderId); setTimeout(() => spamCooldown.delete(senderId), 5000);
-        logger.log(`💳 Initiated payment flow for ${senderId.split('@')[0]}`);
-
-        if (chat.isGroup) {
+        const customMatch = Object.keys(config.customCommands).find(cmd => cmd.toLowerCase() === text);
+        if (customMatch) {
+            spamCooldown.add(senderId); setTimeout(() => spamCooldown.delete(senderId), 5000);
+            logger.log(`💬 Handled custom command[${customMatch}] from ${senderId.split('@')[0]} in ${chat.isGroup ? 'Group' : 'DM'}`);
             await simulateTyping(chat, 1000);
-            const contact = await msg.getContact();
-            let groupMsg = config.messages.groupReply.replace('@user', `@${contact.number}`);
-            await chat.sendMessage(groupMsg, { mentions: [contact] });
 
-            const dmChat = await client.getChatById(senderId);
-            await sendMenu(dmChat, senderId, config);
-        } else {
-            await sendMenu(chat, senderId, config);
-        }
-    }
-    else if (!chat.isGroup) {
-        const session = userSessions.get(senderId);
-        if (!session) return;
-
-        if (Date.now() - session.timestamp > 600000) {
-            userSessions.delete(senderId);
+            if (chat.isGroup) {
+                const contact = await msg.getContact();
+                await chat.sendMessage(`@${contact.id.user} ${config.customCommands[customMatch]}`, { mentions: [contact] });
+            } else {
+                await chat.sendMessage(config.customCommands[customMatch]);
+            }
             return;
         }
 
-        if (session.state === 'MENU' && !isNaN(text)) {
-            const index = parseInt(text) - 1;
-            const coins = Object.keys(config.wallets);
+        if (text === trigger) {
+            spamCooldown.add(senderId); setTimeout(() => spamCooldown.delete(senderId), 5000);
+            logger.log(`💳 Initiated payment flow for ${senderId.split('@')[0]} in ${chat.isGroup ? 'Group' : 'DM'}`);
 
-            if (index >= 0 && index < coins.length) {
-                const selectedCoin = coins[index];
-                const address = config.wallets[selectedCoin];
-
-                logger.log(`🏦 Sent ${selectedCoin} wallet to ${senderId.split('@')[0]}`);
-                await simulateTyping(chat, 2000);
-                const qrDataUrl = await qrcode.toDataURL(address, { width: 400, margin: 2 });
-                const media = new MessageMedia('image/png', qrDataUrl.split(',')[1], 'wallet-qr.png');
-
-                await chat.sendMessage(media, { caption: `🏦 *${selectedCoin}*\n\n\`\`\`${address}\`\`\`\n\n${config.messages.successText}` });
-                userSessions.set(senderId, { state: 'AWAITING_RECEIPT', timestamp: Date.now(), coin: selectedCoin });
-            }
-        }
-        else if (session.state === 'AWAITING_RECEIPT') {
-            logger.log(`🧾 Received receipt from ${senderId.split('@')[0]}`);
-            await simulateTyping(chat, 1000);
-            await chat.sendMessage("✅ *Receipt Received!*\n\nThank you. Our team has been notified and is verifying your transaction. We will get back to you shortly.");
-
-            if (config.adminPhone) {
-                const adminId = `${config.adminPhone.replace(/[^0-9]/g, '')}@c.us`;
+            if (chat.isGroup) {
                 const contact = await msg.getContact();
-                const alertMsg = `🚨 *NEW PAYMENT SUBMISSION*\n\n👤 *From:* +${contact.number}\n🪙 *Network:* ${session.coin}\n💬 *Message:* ${msg.hasMedia ? '[Attached Image]' : text}`;
+                let groupMsg = config.messages.groupReply.replace('@user', `@${contact.id.user}`);
+
+                await simulateTyping(chat, 1000);
+                await chat.sendMessage(groupMsg, { mentions: [contact] });
 
                 try {
-                    if (msg.hasMedia) {
-                        const media = await msg.downloadMedia();
-                        await client.sendMessage(adminId, media, { caption: alertMsg });
-                    } else {
-                        await client.sendMessage(adminId, alertMsg);
-                    }
-                    logger.log(`📬 Receipt forwarded to Admin successfully.`);
-                } catch (err) { logger.error('Could not forward to admin: ' + err.message); }
+                    const dmChat = await contact.getChat();
+                    await sendMenu(dmChat, senderId, config);
+                    logger.log(`📬 Successfully dropped payment menu in ${senderId.split('@')[0]}'s DMs.`);
+                } catch (dmErr) {
+                    logger.error(`Could not DM user ${senderId.split('@')[0]}. WhatsApp Privacy Settings blocked the bot. Error: ${dmErr.message}`);
+                }
+            } else {
+                await sendMenu(chat, senderId, config);
             }
-            userSessions.delete(senderId);
         }
+
+        else if (!chat.isGroup) {
+            const session = userSessions.get(senderId);
+            if (!session) return;
+
+            if (Date.now() - session.timestamp > 600000) {
+                userSessions.delete(senderId);
+                return;
+            }
+
+            if (session.state === 'MENU' && !isNaN(text)) {
+                const index = parseInt(text) - 1;
+                const coins = Object.keys(config.wallets);
+
+                if (index >= 0 && index < coins.length) {
+                    const selectedCoin = coins[index];
+                    const address = config.wallets[selectedCoin];
+
+                    logger.log(`🏦 Sent ${selectedCoin} wallet to ${senderId.split('@')[0]}`);
+                    await simulateTyping(chat, 2000);
+                    const qrDataUrl = await qrcode.toDataURL(address, { width: 400, margin: 2 });
+                    const media = new MessageMedia('image/png', qrDataUrl.split(',')[1], 'wallet-qr.png');
+
+                    await chat.sendMessage(media, { caption: `🏦 *${selectedCoin}*\n\n\`\`\`${address}\`\`\`\n\n${config.messages.successText}` });
+                    userSessions.set(senderId, { state: 'AWAITING_RECEIPT', timestamp: Date.now(), coin: selectedCoin });
+                }
+            }
+            else if (session.state === 'AWAITING_RECEIPT') {
+                logger.log(`🧾 Received receipt from ${senderId.split('@')[0]}`);
+                await simulateTyping(chat, 1000);
+                await chat.sendMessage("✅ *Receipt Received!*\n\nThank you. Our team has been notified and is verifying your transaction. We will get back to you shortly.");
+
+                if (config.adminPhone) {
+                    const adminId = `${config.adminPhone.replace(/[^0-9]/g, '')}@c.us`;
+                    const contact = await msg.getContact();
+                    const alertMsg = `🚨 *NEW PAYMENT SUBMISSION*\n\n👤 *From:* +${contact.number}\n🪙 *Network:* ${session.coin}\n💬 *Message:* ${msg.hasMedia ? '[Attached Image]' : text}`;
+
+                    try {
+                        if (msg.hasMedia) {
+                            const media = await msg.downloadMedia();
+                            await client.sendMessage(adminId, media, { caption: alertMsg });
+                        } else {
+                            await client.sendMessage(adminId, alertMsg);
+                        }
+                        logger.log(`📬 Receipt forwarded to Admin successfully.`);
+                    } catch (err) { logger.error('Could not forward to admin: ' + err.message); }
+                }
+                userSessions.delete(senderId);
+            }
+        }
+    } catch (globalErr) {
+        // This catches any random WhatsApp bugs and keeps the bot alive!
+        logger.error(`Message Processing Error: ${globalErr.message}`);
     }
 });
 
